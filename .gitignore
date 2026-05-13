@@ -1,0 +1,70 @@
+# Qt / CMake build files
+.qtcreator/
+*.user
+*.user.*
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Qt Creator user files
+*.pro.user
+*.pro.user.*
+*.qmake.stash
+.qtc_clangd/
+
+# Generated Qt files
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+
+# Windows build outputs
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# MinGW / GCC outputs
+*.o
+*.a
+*.so
+*.out
+
+# Android build outputs
+android-build/
+.gradle/
+*.apk
+*.aab
+*.ap_
+local.properties
+
+# Runtime files
+*.log
+*.tmp
+*.bak
+*.db
+*.sqlite
+*.sqlite3
+*.resume
+
+received_files/
+downloads/
+uploads/
+temp/
+cache/
+
+# IDE / editor files
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+Thumbs.db
