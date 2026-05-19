@@ -100,7 +100,7 @@ Rectangle {
                         Text {
                             visible: modelData.kind === "file"
                             Layout.fillWidth: true
-                            text: root.fileTypeLabel(modelData.fileName || modelData.text || "")
+                            text: root.fileDetailText(modelData)
                             color: "#6b7280"
                             font.pixelSize: 12
                         }
@@ -200,6 +200,33 @@ Rectangle {
         if (dot >= 0 && dot < clean.length - 1)
             return clean.slice(dot + 1).toLowerCase() + "\u6587\u4ef6"
         return "\u6587\u4ef6"
+    }
+
+    function fileStatusText(status, sender) {
+        if (status === "rejected") return "\u5df2\u62d2\u7edd"
+        if (status === "sending") return sender === "me" ? "\u53d1\u9001\u4e2d" : "\u7b49\u5f85\u63a5\u6536"
+        if (status === "receiving") return "\u63a5\u6536\u4e2d"
+        if (status === "success") return sender === "me" ? "\u53d1\u9001\u6210\u529f" : "\u63a5\u6536\u6210\u529f"
+        if (status === "failed") return sender === "me" ? "\u53d1\u9001\u5931\u8d25" : "\u63a5\u6536\u5931\u8d25"
+        if (status === "paused") return "\u5df2\u6682\u505c"
+        return ""
+    }
+
+    function transferChannelText(channel) {
+        if (channel === "lan") return "\u901a\u8fc7\u5c40\u57df\u7f51\u4f20\u8f93"
+        if (channel === "ecs") return "\u901a\u8fc7\u516c\u7f51\u4f20\u8f93"
+        return ""
+    }
+
+    function fileDetailText(message) {
+        var type = root.fileTypeLabel(message.fileName || message.text || "")
+        var status = root.fileStatusText(message.fileStatus || "", message.sender || "")
+        var channel = root.transferChannelText(message.transferChannel || "")
+        if (status.length > 0 && channel.length > 0)
+            return type + " / " + channel + " / " + status
+        if (channel.length > 0)
+            return type + " / " + channel
+        return status.length > 0 ? type + " / " + status : type
     }
 
     function pad2(value) {

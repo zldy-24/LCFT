@@ -19,6 +19,7 @@
 #include <QStandardPaths>
 #include <QSettings>
 #include <QSet>
+#include <QList>
 
 // ============ Protocol Constants (must match server.cpp / data_server.cpp) ============
 
@@ -265,7 +266,14 @@ private:
     void appendChatMessage(const QString& from, const QString& to, const QString& text,
                            bool isMe, const QVariantMap& extra = QVariantMap());
     void appendFileChatMessage(const QString& peer, const QString& fileName, qint64 fileSize,
-                               bool isMe, bool isLan = false);
+                               bool isMe, bool isLan = false,
+                               const QString& status = QStringLiteral("sending"),
+                               int taskId = 0,
+                               const QString& channel = QString());
+    void updateFileChatMessageStatus(const QString& peer, const QString& fileName,
+                                     bool isMe, const QString& status, int taskId = 0);
+    void enqueueIncomingOffer(const IncomingOffer& offer);
+    void advanceIncomingOffer();
     void removeLanChatMessages();
     void loadChatHistory();
     void saveChatHistory();
@@ -320,6 +328,7 @@ private:
 
     // Incoming offer
     IncomingOffer m_incomingOffer;
+    QList<IncomingOffer> m_incomingOfferQueue;
 
     // Active worker threads
     QMap<int, QThread*> m_workerThreads;

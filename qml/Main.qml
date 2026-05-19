@@ -60,14 +60,18 @@ ApplicationWindow {
                     sender: msg.isMe ? "me" : "other",
                     text: msg.text,
                     timestamp: msg.timestamp,
+                    statusUpdatedAt: msg.statusUpdatedAt || 0,
                     kind: msg.kind || "text",
                     fileName: msg.fileName || "",
-                    fileSize: msg.fileSize || 0
+                    fileSize: msg.fileSize || 0,
+                    fileStatus: msg.fileStatus || "",
+                    transferChannel: msg.transferChannel || ""
                 })
             }
-            if (msg.timestamp >= convMap[peer].updatedAt) {
-                convMap[peer].updatedAt = msg.timestamp
-                convMap[peer].lastMessage = msg.isPlaceholder ? "\u6682\u65e0\u65b0\u6d88\u606f" : msg.text
+            var activityTime = Math.max(msg.timestamp || 0, msg.statusUpdatedAt || 0)
+            if (activityTime >= convMap[peer].updatedAt) {
+                convMap[peer].updatedAt = activityTime
+                convMap[peer].lastMessage = msg.isPlaceholder ? "\u6682\u65e0\u65b0\u6d88\u606f" : conversationLastMessage(msg)
             }
         }
         var result = []
@@ -77,17 +81,37 @@ ApplicationWindow {
             result.push(convMap[key])
         }
         result.sort(function(a, b) {
-            if (a.isSelf && !b.isSelf)
-                return -1
-            if (!a.isSelf && b.isSelf)
-                return 1
-            if (a.isOfficial && !b.isOfficial)
-                return -1
-            if (!a.isOfficial && b.isOfficial)
-                return 1
             return b.updatedAt - a.updatedAt
         })
         return result
+    }
+
+    function fileStatusText(status, isMe) {
+        if (status === "rejected") return "\u5df2\u62d2\u7edd"
+        if (status === "sending") return isMe ? "\u53d1\u9001\u4e2d" : "\u7b49\u5f85\u63a5\u6536"
+        if (status === "receiving") return "\u63a5\u6536\u4e2d"
+        if (status === "success") return isMe ? "\u53d1\u9001\u6210\u529f" : "\u63a5\u6536\u6210\u529f"
+        if (status === "failed") return isMe ? "\u53d1\u9001\u5931\u8d25" : "\u63a5\u6536\u5931\u8d25"
+        if (status === "paused") return "\u5df2\u6682\u505c"
+        return ""
+    }
+
+    function transferChannelText(channel) {
+        if (channel === "lan") return "\u901a\u8fc7\u5c40\u57df\u7f51\u4f20\u8f93"
+        if (channel === "ecs") return "\u901a\u8fc7\u516c\u7f51\u4f20\u8f93"
+        return ""
+    }
+
+    function conversationLastMessage(msg) {
+        if ((msg.kind || "") !== "file")
+            return msg.text || ""
+        var status = fileStatusText(msg.fileStatus || "", !!msg.isMe)
+        var channel = transferChannelText(msg.transferChannel || "")
+        var name = msg.fileName || msg.text || "\u6587\u4ef6"
+        var prefix = status.length > 0 ? status : channel
+        if (status.length > 0 && channel.length > 0)
+            prefix = status + "\u00b7" + channel
+        return prefix.length > 0 ? (prefix + ": " + name) : name
     }
 
     function isPeerOnline(peerName) {
@@ -193,6 +217,12 @@ ApplicationWindow {
         mobileTab = 0
         Qt.callLater(function() {
             syncConversationSelection()
+            if (window.mobileMode) {
+                if (mobileChatStack.depth > 1)
+                    mobileChatStack.replace(chatPageComp, {}, StackView.Immediate)
+                else
+                    mobileChatStack.push(chatPageComp, {}, StackView.Immediate)
+            }
         })
     }
 
@@ -619,6 +649,12 @@ ApplicationWindow {
                 Layout.fillHeight: true
                 visible: window.mobileTab === 0
                 initialItem: mobileChatHomeComp
+                pushEnter: Transition {}
+                pushExit: Transition {}
+                popEnter: Transition {}
+                popExit: Transition {}
+                replaceEnter: Transition {}
+                replaceExit: Transition {}
             }
 
             Loader {
@@ -684,8 +720,10 @@ ApplicationWindow {
                             onClicked: {
                                 if (window.mobileTab !== index) {
                                     window.mobileTab = index
-                                    if (index === 0)
-                                        mobileChatStack.replace(mobileChatHomeComp)
+                                    if (index === 0) {
+                                        mobileChatStack.clear(StackView.Immediate)
+                                        mobileChatStack.push(mobileChatHomeComp, {}, StackView.Immediate)
+                                    }
                                 }
                             }
                         }

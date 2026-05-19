@@ -1,6 +1,7 @@
 #include "NetworkManager.h"
 
 #include <QNetworkInterface>
+#include <QNetworkProxy>
 #include <QHostAddress>
 #include <QDataStream>
 #include <QCoreApplication>
@@ -103,6 +104,7 @@ static void tuneDataSocket(QTcpSocket* sock)
 {
     static constexpr int BufferSize = 4 * 1024 * 1024;
     if (!sock) return;
+    sock->setProxy(QNetworkProxy::NoProxy);
     sock->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption, BufferSize);
     sock->setSocketOption(QAbstractSocket::SendBufferSizeSocketOption, BufferSize);
 }
@@ -889,12 +891,20 @@ void NetworkManager::handleServerLine(const QString& line)
         return;
     }
 
+    if (line.startsWith(QStringLiteral("FILE_REJECTED ")) ||
+        line.startsWith(QStringLiteral("FILE_DECLINED "))) {
+        QStringList parts = line.split(' ', Qt::SkipEmptyParts);
+        if (parts.size() >= 3) {
+            const QString peerName = decodeProtocolToken(parts[1]);
+            const QString fileName = safeTransferFileName(decodeProtocolToken(parts[2]));
+            updateFileChatMessageStatus(peerName, fileName, true, QStringLiteral("rejected"));
+            m_pendingRequests.remove(peerName + "|" + fileName);
+        }
+        return;
+    }
+
     // ---------- FILE_OFFER ----------
     if (line.startsWith(QStringLiteral("FILE_OFFER "))) {
-        if (m_incomingOffer.valid) {
-            emit notification(QStringLiteral("已有待处理的文件请求，新请求被忽略"));
-            return;
-        }
         QStringList parts = line.split(' ', Qt::SkipEmptyParts);
         if (parts.size() >= 4) {
             const QString fromUser = decodeProtocolToken(parts[1]);
@@ -907,12 +917,13 @@ void NetworkManager::handleServerLine(const QString& line)
                 emit notification(QStringLiteral("正在自动接收自己的文件: %1").arg(fileName));
                 return;
             }
-            m_incomingOffer.valid = true;
-            m_incomingOffer.isLan = false;
-            m_incomingOffer.fromUser = fromUser;
-            m_incomingOffer.fileName = fileName;
-            m_incomingOffer.fileSize = fileSize;
-            emit incomingOfferChanged();
+            IncomingOffer offer;
+            offer.valid = true;
+            offer.isLan = false;
+            offer.fromUser = fromUser;
+            offer.fileName = fileName;
+            offer.fileSize = fileSize;
+            enqueueIncomingOffer(offer);
         }
         return;
     }
@@ -962,6 +973,8 @@ void NetworkManager::handleServerLine(const QString& line)
                 di.direction = "send";
                 di.isLan = false;
                 updateTransferDisplay(taskId, di);
+                updateFileChatMessageStatus(peerName, fileName, true,
+                                            QStringLiteral("sending"), taskId);
 
                 startSendWorker(task);
                 emit notification(QStringLiteral("开始发送 %1 (从 chunk %2 恢复)")
@@ -977,6 +990,8 @@ void NetworkManager::handleServerLine(const QString& line)
                 di.direction = "recv";
                 di.isLan = false;
                 updateTransferDisplay(taskId, di);
+                updateFileChatMessageStatus(peerName, fileName, false,
+                                            QStringLiteral("receiving"), taskId);
 
                 startRecvWorker(taskId, fileName, fileSize, resumeChunk, nullptr, false);
                 emit notification(QStringLiteral("开始接收 %1 (从 chunk %2 恢复)")
@@ -1051,15 +1066,21 @@ void NetworkManager::handleServerLine(const QString& line)
     // ---------- FILE_DONE ----------
     if (line.startsWith(QStringLiteral("FILE_DONE "))) {
         int taskId = line.mid(10).trimmed().toInt();
+        TransferDisplayInfo doneInfo;
         {
             QMutexLocker lock(&m_transferDisplayMutex);
             if (m_transferDisplay.contains(taskId)) {
                 auto& d = m_transferDisplay[taskId];
                 d.state = "completed";
                 d.bytesTransferred = d.fileSize;
+                doneInfo = d;
             }
         }
         emit transfersChanged();
+        if (doneInfo.taskId != 0)
+            updateFileChatMessageStatus(doneInfo.peerName, doneInfo.fileName,
+                                        doneInfo.direction == QStringLiteral("send"),
+                                        QStringLiteral("success"), taskId);
         emit notification(QStringLiteral("任务 %1 已完成").arg(taskId));
         return;
     }
@@ -1076,6 +1097,7 @@ void NetworkManager::initLanServers()
 {
     // UDP discovery socket
     m_udpSocket = new QUdpSocket(this);
+    m_udpSocket->setProxy(QNetworkProxy::NoProxy);
     m_udpSocket->bind(QHostAddress::AnyIPv4, LAN_DISCOVERY_PORT,
                       QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint);
     connect(m_udpSocket, &QUdpSocket::readyRead, this, &NetworkManager::onUdpReadyRead);
@@ -1248,22 +1270,15 @@ void NetworkManager::onLanCtrlNewConnection()
                         return;
                     }
 
-                    if (m_incomingOffer.valid) {
-                        client->write("REJECT\n");
-                        client->waitForBytesWritten(3000);
-                        client->disconnectFromHost();
-                        client->deleteLater();
-                        return;
-                    }
-
-                    m_incomingOffer.valid = true;
-                    m_incomingOffer.isLan = true;
-                    m_incomingOffer.lanSocket = client;
-                    m_incomingOffer.taskId = taskId;
-                    m_incomingOffer.fromUser = fromUser;
-                    m_incomingOffer.fileName = fileName;
-                    m_incomingOffer.fileSize = fileSize;
-                    emit incomingOfferChanged();
+                    IncomingOffer offer;
+                    offer.valid = true;
+                    offer.isLan = true;
+                    offer.lanSocket = client;
+                    offer.taskId = taskId;
+                    offer.fromUser = fromUser;
+                    offer.fileName = fileName;
+                    offer.fileSize = fileSize;
+                    enqueueIncomingOffer(offer);
                     // Don't close the socket yet — we reply ACCEPT/REJECT later
                 }
             } else {
@@ -1344,12 +1359,28 @@ void NetworkManager::lanSendFile(const QString& peerNameOrIp, const QString& fil
         QString savedFileName;
         if (copyFileToReceivedDir(filePath, &savedFileName)) {
             QFileInfo sentFile(localPathFromUrl(filePath));
-            appendFileChatMessage(m_myName, savedFileName, sentFile.size(), true, m_connectionMode == LanOnlyMode);
+            appendFileChatMessage(m_myName, savedFileName, sentFile.size(), true,
+                                  m_connectionMode == LanOnlyMode, QStringLiteral("success"),
+                                  0, m_connectionMode == LanOnlyMode
+                                      ? QStringLiteral("lan")
+                                      : QStringLiteral("ecs"));
             emit transferCompleted(0, savedFileName);
             emit notification(QStringLiteral("已保存到文件库: %1").arg(savedFileName));
         }
         return;
     }
+
+    auto canFallbackToEcs = [this](const QString& peerName) {
+        if (!m_ecsConnected || peerName.contains('.'))
+            return false;
+        for (QString item : m_onlineUsersList) {
+            item.remove(QStringLiteral("(present)"));
+            item = item.trimmed();
+            if (item == peerName)
+                return true;
+        }
+        return false;
+    };
 
     QString ip;
     int targetPort = LAN_CTRL_PORT;
@@ -1366,7 +1397,12 @@ void NetworkManager::lanSendFile(const QString& peerNameOrIp, const QString& fil
                 targetPort = ep.mid(colon + 1).toInt();
             }
         } else {
-            emit notification(QStringLiteral("未找到设备 '%1'，请先执行 LAN 发现").arg(peerNameOrIp));
+            if (canFallbackToEcs(peerNameOrIp)) {
+                emit notification(QStringLiteral("未找到 LAN 设备，改用公网发送给 %1").arg(peerNameOrIp));
+                ecsSendFile(peerNameOrIp, filePath);
+            } else {
+                emit notification(QStringLiteral("未找到设备 '%1'，请先执行 LAN 发现").arg(peerNameOrIp));
+            }
             return;
         }
     }
@@ -1382,6 +1418,8 @@ void NetworkManager::lanSendFile(const QString& peerNameOrIp, const QString& fil
     qint64 fileSize = fi.size();
     QString fullPath = fi.absoluteFilePath();
     int taskId = m_lanLocalTaskId.fetchAndAddRelaxed(1);
+    appendFileChatMessage(peerNameOrIp, fileName, fileSize, true, true,
+                          QStringLiteral("sending"), taskId, QStringLiteral("lan"));
 
     QTcpSocket* handshakeSock = new QTcpSocket(this);
     tuneDataSocket(handshakeSock);
@@ -1431,11 +1469,14 @@ void NetworkManager::lanSendFile(const QString& peerNameOrIp, const QString& fil
             di.isLan = true;
             updateTransferDisplay(taskId, di);
 
-            appendFileChatMessage(peerNameOrIp, fileName, fileSize, true, true);
+            updateFileChatMessageStatus(peerNameOrIp, fileName, true,
+                                        QStringLiteral("sending"), taskId);
             startSendWorker(task);
             emit notification(QStringLiteral("对端已接受，开始发送 %1 (chunk %2)")
                                   .arg(fileName).arg(resumeChunk));
         } else {
+            updateFileChatMessageStatus(peerNameOrIp, fileName, true,
+                                        QStringLiteral("rejected"), taskId);
             emit notification(QStringLiteral("对端拒绝了文件传输"));
         }
 
@@ -1444,7 +1485,14 @@ void NetworkManager::lanSendFile(const QString& peerNameOrIp, const QString& fil
     });
 
     connect(handshakeSock, &QTcpSocket::errorOccurred, this, [=]() {
-        emit notification(QStringLiteral("连接 LAN 对端失败: ") + handshakeSock->errorString());
+        updateFileChatMessageStatus(peerNameOrIp, fileName, true,
+                                    QStringLiteral("failed"), taskId);
+        if (canFallbackToEcs(peerNameOrIp)) {
+            emit notification(QStringLiteral("连接 LAN 对端失败，改用公网发送: ") + handshakeSock->errorString());
+            ecsSendFile(peerNameOrIp, filePath);
+        } else {
+            emit notification(QStringLiteral("连接 LAN 对端失败: ") + handshakeSock->errorString());
+        }
         handshakeSock->deleteLater();
     });
 
@@ -1461,7 +1509,9 @@ void NetworkManager::ecsSendFile(const QString& toUser, const QString& filePath)
         QString savedFileName;
         if (copyFileToReceivedDir(filePath, &savedFileName)) {
             QFileInfo sentFile(localPathFromUrl(filePath));
-            appendFileChatMessage(m_myName, savedFileName, sentFile.size(), true);
+            appendFileChatMessage(m_myName, savedFileName, sentFile.size(), true,
+                                  false, QStringLiteral("success"),
+                                  0, QStringLiteral("ecs"));
             emit transferCompleted(0, savedFileName);
             emit notification(QStringLiteral("已保存到文件库: %1").arg(savedFileName));
         }
@@ -1489,7 +1539,9 @@ void NetworkManager::ecsSendFile(const QString& toUser, const QString& filePath)
     sendCtrlText(QStringLiteral("FILE_SEND %1 %2 %3\n")
                      .arg(toUser, encodeProtocolToken(fileName))
                      .arg(fileSize));
-    appendFileChatMessage(toUser, fileName, fileSize, true);
+    appendFileChatMessage(toUser, fileName, fileSize, true,
+                          false, QStringLiteral("sending"),
+                          0, QStringLiteral("ecs"));
     emit notification(QStringLiteral("文件请求已发送给 %1").arg(toUser));
 }
 
@@ -1576,6 +1628,30 @@ QString NetworkManager::desktopDir() const
     return dir;
 }
 
+void NetworkManager::enqueueIncomingOffer(const IncomingOffer& offer)
+{
+    if (!offer.valid)
+        return;
+    if (!m_incomingOffer.valid) {
+        m_incomingOffer = offer;
+        emit incomingOfferChanged();
+        return;
+    }
+
+    m_incomingOfferQueue.append(offer);
+    emit notification(QStringLiteral("新的文件请求已加入队列"));
+}
+
+void NetworkManager::advanceIncomingOffer()
+{
+    if (!m_incomingOfferQueue.isEmpty()) {
+        m_incomingOffer = m_incomingOfferQueue.takeFirst();
+    } else {
+        m_incomingOffer = IncomingOffer();
+    }
+    emit incomingOfferChanged();
+}
+
 // ============================================================================
 //  Accept / Reject Offer
 // ============================================================================
@@ -1584,25 +1660,28 @@ void NetworkManager::acceptOffer()
 {
     if (!m_incomingOffer.valid) return;
 
+    const IncomingOffer offer = m_incomingOffer;
     int resumeChunk = 0;
-    loadResumeInfo(m_incomingOffer.fileName, m_incomingOffer.fileSize,
-                   chunkSizeForMode(m_incomingOffer.isLan), resumeChunk);
-    appendFileChatMessage(m_incomingOffer.fromUser, m_incomingOffer.fileName,
-                          m_incomingOffer.fileSize, false, m_incomingOffer.isLan);
+    loadResumeInfo(offer.fileName, offer.fileSize,
+                   chunkSizeForMode(offer.isLan), resumeChunk);
+    appendFileChatMessage(offer.fromUser, offer.fileName,
+                          offer.fileSize, false, offer.isLan,
+                          QStringLiteral("receiving"), offer.taskId,
+                          offer.isLan ? QStringLiteral("lan") : QStringLiteral("ecs"));
 
-    if (m_incomingOffer.isLan) {
+    if (offer.isLan) {
         QString resp = QStringLiteral("ACCEPT %1 %2\n").arg(resumeChunk).arg(m_myLanDataPort);
-        m_incomingOffer.lanSocket->write(resp.toUtf8());
-        m_incomingOffer.lanSocket->waitForBytesWritten(5000);
+        offer.lanSocket->write(resp.toUtf8());
+        offer.lanSocket->waitForBytesWritten(5000);
         // Don't delete the socket yet — it belongs to the ctrl channel
-        m_incomingOffer.lanSocket->disconnectFromHost();
-        m_incomingOffer.lanSocket->deleteLater();
+        offer.lanSocket->disconnectFromHost();
+        offer.lanSocket->deleteLater();
 
         {
             QMutexLocker lock(&m_lanAcceptedMutex);
-            m_lanAcceptedTasks[m_incomingOffer.taskId] = {
-                m_incomingOffer.fileName,
-                m_incomingOffer.fileSize,
+            m_lanAcceptedTasks[offer.taskId] = {
+                offer.fileName,
+                offer.fileSize,
                 resumeChunk
             };
         }
@@ -1612,25 +1691,24 @@ void NetworkManager::acceptOffer()
         sendCtrlText(QStringLiteral("YES %1\n").arg(resumeChunk));
     }
 
-    m_incomingOffer.valid = false;
-    emit incomingOfferChanged();
+    advanceIncomingOffer();
 }
 
 void NetworkManager::rejectOffer()
 {
     if (!m_incomingOffer.valid) return;
 
-    if (m_incomingOffer.isLan) {
-        m_incomingOffer.lanSocket->write("REJECT\n");
-        m_incomingOffer.lanSocket->waitForBytesWritten(3000);
-        m_incomingOffer.lanSocket->disconnectFromHost();
-        m_incomingOffer.lanSocket->deleteLater();
+    const IncomingOffer offer = m_incomingOffer;
+    if (offer.isLan) {
+        offer.lanSocket->write("REJECT\n");
+        offer.lanSocket->waitForBytesWritten(3000);
+        offer.lanSocket->disconnectFromHost();
+        offer.lanSocket->deleteLater();
     } else {
         sendCtrlText(QStringLiteral("NO\n"));
     }
 
-    m_incomingOffer.valid = false;
-    emit incomingOfferChanged();
+    advanceIncomingOffer();
 }
 
 // ============================================================================
@@ -1660,6 +1738,12 @@ void NetworkManager::pauseTask(int taskId)
             m_transferDisplay[taskId].state = "paused";
     }
     emit transfersChanged();
+    TransferDisplayInfo info;
+    { QMutexLocker lock(&m_transferDisplayMutex); info = m_transferDisplay.value(taskId); }
+    if (info.taskId != 0)
+        updateFileChatMessageStatus(info.peerName, info.fileName,
+                                    info.direction == QStringLiteral("send"),
+                                    QStringLiteral("paused"), taskId);
 }
 
 void NetworkManager::resumeTask(int taskId)
@@ -1687,6 +1771,15 @@ void NetworkManager::resumeTask(int taskId)
                                                   ? "sending" : "receiving";
     }
     emit transfersChanged();
+    TransferDisplayInfo info;
+    { QMutexLocker lock(&m_transferDisplayMutex); info = m_transferDisplay.value(taskId); }
+    if (info.taskId != 0)
+        updateFileChatMessageStatus(info.peerName, info.fileName,
+                                    info.direction == QStringLiteral("send"),
+                                    info.direction == QStringLiteral("send")
+                                        ? QStringLiteral("sending")
+                                        : QStringLiteral("receiving"),
+                                    taskId);
 }
 
 void NetworkManager::pauseAll()
@@ -1788,25 +1881,36 @@ void NetworkManager::startRecvWorker(int taskId, const QString& fileName, qint64
 
 void NetworkManager::onWorkerProgress(int taskId, qint64 bytesTransferred, double speedMBps)
 {
+    TransferDisplayInfo info;
     {
         QMutexLocker lock(&m_transferDisplayMutex);
         if (m_transferDisplay.contains(taskId)) {
             m_transferDisplay[taskId].bytesTransferred = bytesTransferred;
             m_transferDisplay[taskId].speedMBps = speedMBps;
+            info = m_transferDisplay[taskId];
         }
     }
     emit transfersChanged();
+    if (info.taskId != 0 && info.state != QStringLiteral("paused"))
+        updateFileChatMessageStatus(info.peerName, info.fileName,
+                                    info.direction == QStringLiteral("send"),
+                                    info.direction == QStringLiteral("send")
+                                        ? QStringLiteral("sending")
+                                        : QStringLiteral("receiving"),
+                                    taskId);
 }
 
 void NetworkManager::onWorkerFinished(int taskId)
 {
     markTransferFinished(taskId);
+    TransferDisplayInfo info;
     {
         QMutexLocker lock(&m_transferDisplayMutex);
         if (m_transferDisplay.contains(taskId)) {
             auto& d = m_transferDisplay[taskId];
             d.state = "completed";
             d.bytesTransferred = d.fileSize;
+            info = d;
         }
     }
     m_workerThreads.remove(taskId);
@@ -1819,6 +1923,10 @@ void NetworkManager::onWorkerFinished(int taskId)
 
     QString fileName;
     { QMutexLocker lock(&m_transferDisplayMutex); fileName = m_transferDisplay.value(taskId).fileName; }
+    if (info.taskId != 0)
+        updateFileChatMessageStatus(info.peerName, info.fileName,
+                                    info.direction == QStringLiteral("send"),
+                                    QStringLiteral("success"), taskId);
     emit transferCompleted(taskId, fileName);
     emit notification(QStringLiteral("传输完成: %1").arg(fileName));
 }
@@ -1826,10 +1934,13 @@ void NetworkManager::onWorkerFinished(int taskId)
 void NetworkManager::onWorkerError(int taskId, const QString& message)
 {
     markTransferFinished(taskId);
+    TransferDisplayInfo info;
     {
         QMutexLocker lock(&m_transferDisplayMutex);
-        if (m_transferDisplay.contains(taskId))
+        if (m_transferDisplay.contains(taskId)) {
             m_transferDisplay[taskId].state = "failed";
+            info = m_transferDisplay[taskId];
+        }
     }
     m_workerThreads.remove(taskId);
     m_transferControls.remove(taskId);
@@ -1838,6 +1949,10 @@ void NetworkManager::onWorkerError(int taskId, const QString& message)
         m_sendTasks.remove(taskId);
     }
     emit transfersChanged();
+    if (info.taskId != 0)
+        updateFileChatMessageStatus(info.peerName, info.fileName,
+                                    info.direction == QStringLiteral("send"),
+                                    QStringLiteral("failed"), taskId);
     emit transferFailed(taskId, message);
     emit notification(QStringLiteral("传输失败 [%1]: %2").arg(taskId).arg(message));
 }
@@ -2160,12 +2275,20 @@ void NetworkManager::appendChatMessage(const QString& from, const QString& to, c
 }
 
 void NetworkManager::appendFileChatMessage(const QString& peer, const QString& fileName, qint64 fileSize,
-                                           bool isMe, bool isLan)
+                                           bool isMe, bool isLan,
+                                           const QString& status, int taskId,
+                                           const QString& channel)
 {
     QVariantMap extra;
     extra["kind"] = QStringLiteral("file");
     extra["fileName"] = fileName;
     extra["fileSize"] = fileSize;
+    extra["fileStatus"] = status;
+    extra["transferChannel"] = channel.isEmpty()
+                                   ? (isLan ? QStringLiteral("lan") : QStringLiteral("ecs"))
+                                   : channel;
+    if (taskId != 0)
+        extra["transferTaskId"] = taskId;
     if (isLan)
         extra["isLan"] = true;
     appendChatMessage(isMe ? m_myName : peer,
@@ -2175,6 +2298,48 @@ void NetworkManager::appendFileChatMessage(const QString& peer, const QString& f
                           .arg(fileSize / 1024.0 / 1024.0, 0, 'f', 2),
                       isMe,
                       extra);
+}
+
+void NetworkManager::updateFileChatMessageStatus(const QString& peer, const QString& fileName,
+                                                 bool isMe, const QString& status, int taskId)
+{
+    bool changed = false;
+    const QString safeName = safeTransferFileName(fileName);
+
+    for (int i = m_chatMessages.size() - 1; i >= 0; --i) {
+        QVariantMap msg = m_chatMessages[i].toMap();
+        if (msg.value(QStringLiteral("kind")).toString() != QStringLiteral("file"))
+            continue;
+
+        const bool sameTask = taskId != 0 && msg.value(QStringLiteral("transferTaskId")).toInt() == taskId;
+        const QString msgPeer = msg.value(QStringLiteral("isMe")).toBool()
+                                    ? msg.value(QStringLiteral("to")).toString()
+                                    : msg.value(QStringLiteral("from")).toString();
+        const bool sameFile = safeTransferFileName(msg.value(QStringLiteral("fileName")).toString()) == safeName;
+        const bool sameDirection = msg.value(QStringLiteral("isMe")).toBool() == isMe;
+
+        if (!sameTask && !(sameDirection && sameFile && msgPeer == peer))
+            continue;
+
+        if (msg.value(QStringLiteral("fileStatus")).toString() != status) {
+            msg[QStringLiteral("fileStatus")] = status;
+            changed = true;
+        }
+        if (taskId != 0 && msg.value(QStringLiteral("transferTaskId")).toInt() != taskId) {
+            msg[QStringLiteral("transferTaskId")] = taskId;
+            changed = true;
+        }
+        if (changed) {
+            msg[QStringLiteral("statusUpdatedAt")] = QDateTime::currentMSecsSinceEpoch();
+            m_chatMessages[i] = msg;
+        }
+        break;
+    }
+
+    if (!changed)
+        return;
+    saveChatHistory();
+    emit chatMessagesChanged();
 }
 
 void NetworkManager::removeLanChatMessages()

@@ -68,3 +68,14 @@ cache/
 # System files
 .DS_Store
 Thumbs.db
+
+# Local user folders / personal test folders
+zldy/
+liu/
+ljx/
+test_user1/
+test_user2/
+temp_user/
+
+# Local draft file
+1.txt

@@ -68,13 +68,45 @@ Rectangle {
             clip: true
             model: root.filteredTransfers
             delegate: ItemDelegate {
+                id: transferDelegate
                 width: list.width
-                height: 82
-                contentItem: Column {
+                height: 92
+                background: Rectangle {
+                    color: transferDelegate.down ? "#f1f3f5" : (transferDelegate.highlighted ? "#f5f6f7" : "#ffffff")
+                }
+                contentItem: ColumnLayout {
                     spacing: 8
-                    Text { text: modelData.fileName + "  [" + root.stateText(modelData.state) + "]"; font.bold: true; color: "#111827"; elide: Text.ElideRight; width: parent.width }
-                    ProgressBar { width: parent.width; from: 0; to: Math.max(1, modelData.fileSize); value: modelData.bytesTransferred }
-                    Text { text: (modelData.bytesTransferred / 1024 / 1024).toFixed(1) + " / " + (modelData.fileSize / 1024 / 1024).toFixed(1) + " MB, " + modelData.speedMBps.toFixed(2) + " MB/s"; color: "#6b7280"; font.pixelSize: 12 }
+                    Text {
+                        Layout.fillWidth: true
+                        text: modelData.fileName + "  [" + root.stateText(modelData.state) + "]"
+                        font.bold: true
+                        color: "#111827"
+                        elide: Text.ElideRight
+                    }
+                    ProgressBar {
+                        Layout.fillWidth: true
+                        from: 0
+                        to: Math.max(1, modelData.fileSize)
+                        value: modelData.bytesTransferred
+                    }
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text {
+                            Layout.fillWidth: true
+                            text: (modelData.bytesTransferred / 1024 / 1024).toFixed(1) + " / " + (modelData.fileSize / 1024 / 1024).toFixed(1) + " MB, " + modelData.speedMBps.toFixed(2) + " MB/s"
+                            color: "#6b7280"
+                            font.pixelSize: 12
+                            elide: Text.ElideRight
+                        }
+                        Text {
+                            text: root.fileSuffix(modelData.fileName)
+                            visible: text.length > 0
+                            color: "#9ca3af"
+                            font.pixelSize: 12
+                            font.bold: true
+                            horizontalAlignment: Text.AlignRight
+                        }
+                    }
                 }
             }
         }
@@ -87,5 +119,13 @@ Rectangle {
         if (state === "completed") return "\u5df2\u5b8c\u6210"
         if (state === "failed") return "\u5931\u8d25"
         return state || ""
+    }
+
+    function fileSuffix(name) {
+        var clean = name || ""
+        var dot = clean.lastIndexOf(".")
+        if (dot < 0 || dot === clean.length - 1)
+            return ""
+        return clean.slice(dot).toLowerCase()
     }
 }
