@@ -9,7 +9,7 @@ ApplicationWindow {
     width: 810
     height: 570
     visible: true
-    title: "\u5c40\u57df\u7f51 / \u516c\u7f51\u6587\u4ef6\u4f20\u8f93"
+    title: "LCFT"
     color: "#f5f6f7"
 
     property int currentTab: 0
@@ -23,6 +23,14 @@ ApplicationWindow {
     property string mobileSearchText: ""
     property bool choosingLibraryFile: false
     property string currentLibraryPath: networkManager.receivedFilesDir
+    property int selectedTransferTaskId: 0
+    property var selectedTransferInfo: null
+    property var knownTransferStates: ({})
+    property var pendingCompletedTransferIds: ({})
+    property int transferBadgeCount: transferActiveCount() + transferPendingCompletedCount()
+    property bool transferBadgeVisible: transferBadgeCount > 0
+
+    onCurrentTabChanged: refreshTransferBadge()
 
     property var conversationData: {
         var convMap = {}
@@ -100,6 +108,71 @@ ApplicationWindow {
         if (channel === "lan") return "\u901a\u8fc7\u5c40\u57df\u7f51\u4f20\u8f93"
         if (channel === "ecs") return "\u901a\u8fc7\u516c\u7f51\u4f20\u8f93"
         return ""
+    }
+
+    function transferIsDone(state) {
+        return state === "completed" || state === "failed"
+    }
+
+    function transferIsActive(state) {
+        return state === "sending" || state === "receiving" || state === "paused"
+    }
+
+    function transferByTaskId(taskId) {
+        var items = networkManager.transfers
+        for (var i = 0; i < items.length; ++i) {
+            if (items[i].taskId === taskId)
+                return items[i]
+        }
+        return null
+    }
+
+    function transferActiveCount() {
+        var count = 0
+        var items = networkManager.transfers
+        for (var i = 0; i < items.length; ++i) {
+            if (transferIsActive(items[i].state))
+                ++count
+        }
+        return count
+    }
+
+    function transferPendingCompletedCount() {
+        var count = 0
+        for (var id in pendingCompletedTransferIds) {
+            if (pendingCompletedTransferIds[id])
+                ++count
+        }
+        return count
+    }
+
+    function refreshSelectedTransfer() {
+        selectedTransferInfo = selectedTransferTaskId > 0 ? transferByTaskId(selectedTransferTaskId) : null
+        if (!selectedTransferInfo)
+            selectedTransferTaskId = 0
+    }
+
+    function refreshTransferBadge() {
+        var nextKnown = {}
+        var nextPending = {}
+        for (var pendingId in pendingCompletedTransferIds) {
+            if (pendingCompletedTransferIds[pendingId])
+                nextPending[pendingId] = true
+        }
+
+        var items = networkManager.transfers
+        for (var i = 0; i < items.length; ++i) {
+            var item = items[i]
+            var id = "" + item.taskId
+            var previous = knownTransferStates[id] || ""
+            if (transferIsDone(item.state) && !transferIsDone(previous) && currentTab !== 2)
+                nextPending[id] = true
+            nextKnown[id] = item.state || ""
+        }
+
+        knownTransferStates = nextKnown
+        pendingCompletedTransferIds = currentTab === 2 ? ({}) : nextPending
+        refreshSelectedTransfer()
     }
 
     function conversationLastMessage(msg) {
@@ -240,6 +313,8 @@ ApplicationWindow {
         function onChatMessagesChanged() { Qt.callLater(window.syncConversationSelection) }
         function onOnlineUsersChanged() { Qt.callLater(window.syncConversationSelection) }
         function onPeersChanged() { Qt.callLater(window.syncConversationSelection) }
+        function onReceivedFilesDirChanged() { window.currentLibraryPath = networkManager.receivedFilesDir }
+        function onTransfersChanged() { window.refreshTransferBadge() }
     }
 
     Loader {
@@ -348,15 +423,6 @@ ApplicationWindow {
                         color: "#1d4ed8"
                     }
                 }
-                Button {
-                    Layout.preferredWidth: 82
-                    Layout.preferredHeight: 30
-                    text: "\u6e05\u7a7a\u8bb0\u5f55"
-                    font.pixelSize: 12
-                    onClicked: {
-                        networkManager.clearLocalData()
-                    }
-                }
                 ColumnLayout {
                     Layout.fillWidth: true
                     Text {
@@ -379,10 +445,12 @@ ApplicationWindow {
 
             Text { text: "\u6587\u4ef6\u5e93"; color: "#6b7280"; font.pixelSize: 12 }
             Text {
-                text: "\u9ed8\u8ba4\u6587\u4ef6\u5e93"
+                text: networkManager.receivedFilesDir
                 color: "#111827"
                 font.pixelSize: 15
                 font.bold: true
+                elide: Text.ElideMiddle
+                Layout.fillWidth: true
             }
 
             Item { Layout.fillHeight: true }
@@ -402,7 +470,7 @@ ApplicationWindow {
         id: desktopMenuPopup
         modal: true
         focus: true
-        width: 150
+        width: 220
         height: 112
         x: 12
         y: Math.max(12, window.height - height - 16)
@@ -466,11 +534,21 @@ ApplicationWindow {
 
     Component { id: conversationListComp; ConversationList { conversations: window.conversationData; currentIndex: window.currentConversationIndex; onConversationClicked: function(index) { window.selectConversationByIndex(index) } } }
     Component { id: contactListComp; ContactList { onPeerSelected: function(peerName, isLan) { window.selectedPeerName = peerName; window.selectedPeerIsLan = isLan } } }
-    Component { id: transferListComp; TransferList { searchText: window.mobileMode ? window.mobileSearchText : "" } }
+    Component {
+        id: transferListComp
+        TransferList {
+            searchText: window.mobileMode ? window.mobileSearchText : ""
+            selectedTaskId: window.selectedTransferTaskId
+            onTransferSelected: function(transferInfo) {
+                window.selectedTransferTaskId = transferInfo.taskId || 0
+                window.selectedTransferInfo = transferInfo
+            }
+        }
+    }
     Component { id: fileListComp; FileList { currentPath: window.currentLibraryPath; onLibrarySelected: function(path) { window.currentLibraryPath = path } } }
     Component { id: chatPageComp; ChatPage { conversationInfo: window.conversationData.length > 0 ? window.conversationData[window.currentConversationIndex] : null; showBackButton: window.mobileMode; canSendText: window.canSendTextTo(window.currentConversationName()); canSendFile: window.currentConversationName().length > 0 && window.currentConversationName() !== "LCFT"; onBackRequested: mobileChatStack.pop(); onOpenFilePicker: window.mobileMode ? nativeFileDialog.open() : fileSourcePopup.open(); onSendMessage: function(text) { window.sendMessageToCurrentConversation(text) } } }
     Component { id: contactDetailPageComp; ContactDetailPage { peerName: window.selectedPeerName; peerIsLan: window.selectedPeerIsLan; onOpenChat: function(peerName) { window.openConversation(peerName) } } }
-    Component { id: transferDetailPageComp; TransferDetailPage {} }
+    Component { id: transferDetailPageComp; TransferDetailPage { transferInfo: window.selectedTransferInfo } }
     Component { id: fileDetailPageComp; FileDetailPage { currentLibraryPath: window.currentLibraryPath; searchText: window.mobileMode ? window.mobileSearchText : "" } }
     Component {
         id: mobileChatHomeComp
@@ -508,6 +586,8 @@ ApplicationWindow {
             LeftNavBar {
                 anchors.fill: parent
                 currentTab: window.currentTab
+                transferBadgeVisible: window.transferBadgeVisible
+                transferBadgeCount: window.transferBadgeCount
                 onTabClicked: function(index) { window.currentTab = index }
                 onMenuRequested: desktopMenuPopup.open()
             }

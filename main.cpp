@@ -18,18 +18,18 @@ int main(int argc, char *argv[])
     LibraryManager libraryManager;
     NetworkManager networkManager;
     QDir().mkpath(networkManager.receivedFilesDir());
-    libraryManager.addLibrary(networkManager.receivedFilesDir());
+    libraryManager.setPrimaryLibrary(networkManager.receivedFilesDir());
     QObject::connect(&networkManager, &NetworkManager::receivedFilesDirChanged,
                      &libraryManager, [&]() {
                          QDir().mkpath(networkManager.receivedFilesDir());
-                         libraryManager.addLibrary(networkManager.receivedFilesDir());
+                         libraryManager.setPrimaryLibrary(networkManager.receivedFilesDir());
                      });
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("libraryManager"), &libraryManager);
     engine.rootContext()->setContextProperty(QStringLiteral("networkManager"), &networkManager);
 
-    const QUrl url(QStringLiteral("qrc:/qt/qml/LanChatShell/qml/Main.qml"));
+    const QUrl url(QStringLiteral("qrc:/qt/qml/LCFT/qml/Main.qml"));
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed,
                      &app, []() { QCoreApplication::exit(-1); }, Qt::QueuedConnection);
     engine.load(url);

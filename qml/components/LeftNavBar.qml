@@ -7,6 +7,8 @@ Rectangle {
     color: "#202329"
 
     property int currentTab: 0
+    property bool transferBadgeVisible: false
+    property int transferBadgeCount: 0
     signal tabClicked(int index)
     signal menuRequested()
 
@@ -81,15 +83,16 @@ Rectangle {
                     }
 
                     Rectangle {
-                        visible: index === 2 && networkManager.transfers.length > 0
+                        visible: index === 2 && root.transferBadgeVisible
                         anchors.horizontalCenter: parent.horizontalCenter
-                        width: 16
+                        width: root.transferBadgeCount > 0 ? Math.max(16, badgeText.implicitWidth + 8) : 8
                         height: 10
                         radius: 5
                         color: "#ef4444"
                         Text {
+                            id: badgeText
                             anchors.centerIn: parent
-                            text: networkManager.transfers.length
+                            text: root.transferBadgeCount > 0 ? root.transferBadgeCount : ""
                             font.pixelSize: 8
                             color: "white"
                             font.bold: true

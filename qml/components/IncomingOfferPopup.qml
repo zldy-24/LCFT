@@ -61,8 +61,11 @@ Popup {
 
         RowLayout {
             Layout.fillWidth: true
+            Layout.alignment: Qt.AlignHCenter
+            spacing: 28
             Button {
-                Layout.fillWidth: true
+                Layout.preferredWidth: 176
+                Layout.preferredHeight: 36
                 text: "\u540c\u610f"
                 background: Rectangle {
                     radius: 6
@@ -78,7 +81,8 @@ Popup {
                 onClicked: networkManager.acceptOffer()
             }
             Button {
-                Layout.fillWidth: true
+                Layout.preferredWidth: 176
+                Layout.preferredHeight: 36
                 text: "\u62d2\u7edd"
                 background: Rectangle {
                     radius: 6

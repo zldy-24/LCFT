@@ -4,7 +4,7 @@
 
 LibraryManager::LibraryManager(QObject *parent)
     : QObject(parent)
-    , m_settings("LanChatShell", "FileLibraries")
+    , m_settings("LCFT", "FileLibraries")
 {
     load();
 }
@@ -22,6 +22,18 @@ void LibraryManager::addLibrary(const QString &path)
         save();
         emit librariesChanged();
     }
+}
+
+void LibraryManager::setPrimaryLibrary(const QString &path)
+{
+    QString cleanPath = QDir::cleanPath(path);
+    if (!QDir(cleanPath).exists())
+        return;
+
+    m_libraries.removeAll(cleanPath);
+    m_libraries.prepend(cleanPath);
+    save();
+    emit librariesChanged();
 }
 
 void LibraryManager::removeLibrary(int index)

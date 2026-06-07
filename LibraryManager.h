@@ -16,6 +16,7 @@ public:
     QStringList libraries() const;
 
     Q_INVOKABLE void addLibrary(const QString &path);
+    Q_INVOKABLE void setPrimaryLibrary(const QString &path);
     Q_INVOKABLE void removeLibrary(int index);
     Q_INVOKABLE QString libraryPath(int index) const;
 

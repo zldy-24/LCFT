@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 
 Rectangle {
     id: root
@@ -25,6 +26,12 @@ Rectangle {
         if (lanDisplayName.text.trim().length === 0)
             return
         networkManager.startLanMode(lanDisplayName.text.trim())
+    }
+
+    function folderUrl(path) {
+        if (!path || path.length === 0)
+            return ""
+        return path.charAt(0) === "/" ? "file://" + path : "file:///" + path.replace(/\\/g, "/")
     }
 
     Connections {
@@ -58,7 +65,7 @@ Rectangle {
         spacing: 14
 
         Text {
-            text: "\u5c40\u57df\u7f51 / \u516c\u7f51\u4f20\u8f93"
+            text: "LCFT"
             font.pixelSize: 32
             font.bold: true
             color: "#e8e8e8"
@@ -66,7 +73,7 @@ Rectangle {
         }
 
         Text {
-            text: "\u5c40\u57df\u7f51 / \u516c\u7f51 \u6587\u4ef6\u4f20\u8f93\u5668"
+            text: "LAN/WAN Crossing-platform File transferer"
             font.pixelSize: 14
             color: "#8b949e"
             Layout.alignment: Qt.AlignHCenter
@@ -90,6 +97,46 @@ Rectangle {
                 Layout.preferredHeight: 52
                 text: "\ud83d\udce1  \u5c40\u57df\u7f51\u6a21\u5f0f"
                 onClicked: { root.showLanForm = true; root.errorMessage = "" }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: 58
+                radius: 8
+                color: "#23262b"
+                border.color: "#343941"
+
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 12
+                    anchors.rightMargin: 10
+                    spacing: 10
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 2
+                        Text {
+                            text: "\u6587\u4ef6\u5e93\u6839\u8def\u5f84"
+                            color: "#cbd5e1"
+                            font.pixelSize: 12
+                        }
+                        Text {
+                            Layout.fillWidth: true
+                            text: networkManager.libraryRootDir
+                            color: "#f3f4f6"
+                            font.pixelSize: 13
+                            elide: Text.ElideMiddle
+                        }
+                    }
+
+                    Button {
+                        Layout.preferredWidth: 78
+                        Layout.preferredHeight: 34
+                        text: "\u4fee\u6539"
+                        font.pixelSize: 12
+                        onClicked: libraryRootDialog.open()
+                    }
+                }
             }
 
             Text {
@@ -214,7 +261,7 @@ Rectangle {
     Button {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        anchors.rightMargin: 18
+        anchors.rightMargin: 20
         anchors.bottomMargin: 18
         width: 150
         height: 34
@@ -222,5 +269,12 @@ Rectangle {
         text: "\u6e05\u7a7a\u6240\u6709\u672c\u5730\u8bb0\u5f55"
         font.pixelSize: 12
         onClicked: networkManager.clearAllLocalData()
+    }
+
+    FolderDialog {
+        id: libraryRootDialog
+        title: "\u9009\u62e9\u6587\u4ef6\u5e93\u6839\u8def\u5f84"
+        currentFolder: root.folderUrl(networkManager.libraryRootDir)
+        onAccepted: networkManager.setLibraryRootDir(selectedFolder)
     }
 }

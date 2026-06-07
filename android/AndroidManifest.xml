@@ -46,7 +46,7 @@
 
             <meta-data
                 android:name="android.app.lib_name"
-                android:value="appLanChatShell" />
+                android:value="LCFT" />
 
             <meta-data
                 android:name="android.app.arguments"

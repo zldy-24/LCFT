@@ -124,6 +124,29 @@ static void clearDirectoryContents(const QString& path)
     }
 }
 
+static bool copyDirectoryRecursively(const QString& sourcePath, const QString& targetPath)
+{
+    QDir sourceDir(sourcePath);
+    if (!sourceDir.exists())
+        return false;
+
+    QDir targetDir(targetPath);
+    if (!targetDir.exists() && !QDir().mkpath(targetPath))
+        return false;
+
+    const QFileInfoList entries = sourceDir.entryInfoList(QDir::NoDotAndDotDot | QDir::AllEntries);
+    for (const QFileInfo& entry : entries) {
+        const QString targetEntryPath = targetDir.absoluteFilePath(entry.fileName());
+        if (entry.isDir()) {
+            if (!copyDirectoryRecursively(entry.absoluteFilePath(), targetEntryPath))
+                return false;
+        } else if (!QFile::copy(entry.absoluteFilePath(), targetEntryPath)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static QString safeFileNameToken(const QString& fileName)
 {
     QString safe = QFileInfo(fileName).fileName().trimmed();
@@ -326,12 +349,12 @@ class RecvWorkerThread : public QThread {
     Q_OBJECT
 public:
     RecvWorkerThread(int taskId, const QString& fileName, qint64 fileSize,
-                     int resumeChunk, bool isLan, const QString& dataDir,
+                     int resumeChunk, bool isLan, const QString& receivedDir,
                      QSharedPointer<TransferControl> control,
                      QObject* parent = nullptr)
         : QThread(parent), m_taskId(taskId), m_fileName(fileName),
           m_fileSize(fileSize), m_resumeChunk(resumeChunk),
-          m_isLan(isLan), m_dataDir(dataDir), m_control(control) {}
+          m_isLan(isLan), m_receivedDir(receivedDir), m_control(control) {}
 
     void setLanSocket(QTcpSocket* sock) { m_lanSocket = sock; }
 
@@ -369,7 +392,7 @@ protected:
         }
 
         // --- Prepare output file ---
-        QString recvDir = m_dataDir + QStringLiteral("/received_file");
+        QString recvDir = m_receivedDir;
         QString partDir = recvDir + QStringLiteral("/part");
         QDir().mkpath(partDir);
 
@@ -445,7 +468,7 @@ protected:
             int nextChunk = hdr.chunk_index + 1;
             if ((nextChunk % ResumeSaveIntervalChunks) == 0 || totalRecv >= m_fileSize) {
                 outFile.flush();
-                QString resumePath = m_dataDir + "/received_file/part/" + m_fileName + ".resume";
+                QString resumePath = m_receivedDir + "/part/" + m_fileName + ".resume";
                 QFile rf(resumePath);
                 if (rf.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
                     const QByteArray fingerprint = QCryptographicHash::hash(
@@ -486,7 +509,7 @@ protected:
 
         // Clean up resume info if complete
         if (totalRecv >= m_fileSize) {
-            QString resumePath = m_dataDir + "/received_file/part/" + m_fileName + ".resume";
+            QString resumePath = m_receivedDir + "/part/" + m_fileName + ".resume";
             QFile::remove(resumePath);
         }
 
@@ -524,7 +547,7 @@ private:
     qint64 m_fileSize;
     int m_resumeChunk;
     bool m_isLan;
-    QString m_dataDir;
+    QString m_receivedDir;
     QSharedPointer<TransferControl> m_control;
     QTcpSocket* m_lanSocket = nullptr;
 };
@@ -535,10 +558,12 @@ private:
 
 NetworkManager::NetworkManager(QObject* parent)
     : QObject(parent)
-    , m_chatSettings(QStringLiteral("LanChatShell"), QStringLiteral("ChatHistory"))
+    , m_chatSettings(QStringLiteral("LCFT"), QStringLiteral("ChatHistory"))
 {
-    // Ensure receive directories
-    QDir().mkpath(baseDataDir() + "/received_file/part");
+    loadLibraryRootDirSetting();
+    loadReceiveTargetDirSetting();
+
+    prepareReceiveDirectories();
 
     initLanServers();
 }
@@ -547,6 +572,7 @@ NetworkManager::~NetworkManager()
 {
     m_running = false;
     stopAllWorkers();
+    clearLanTemporaryLibrary();
 
     if (m_ecsSocket) {
         m_ecsSocket->disconnectFromHost();
@@ -652,6 +678,10 @@ QVariantList NetworkManager::transfers() const
         m["peerName"] = d.peerName;
         m["isLan"] = d.isLan;
         m["direction"] = d.direction;
+        m["startedAt"] = d.startedAt;
+        m["endedAt"] = d.endedAt;
+        m["durationMs"] = (d.startedAt > 0 && d.endedAt >= d.startedAt) ? (d.endedAt - d.startedAt) : 0;
+        m["errorMessage"] = d.errorMessage;
         list.append(m);
     }
     return list;
@@ -678,6 +708,8 @@ void NetworkManager::loginEcs(const QString& user, const QString& pass)
         m_transferDisplay.clear();
     }
     m_pendingRequests.clear();
+    loadLibraryRootDirSetting();
+    loadReceiveTargetDirSetting();
     loadChatHistory();
     {
         QMutexLocker lock(&m_peersMutex);
@@ -685,7 +717,8 @@ void NetworkManager::loginEcs(const QString& user, const QString& pass)
     }
     emit myNameChanged();
     emit receivedFilesDirChanged();
-    QDir().mkpath(receivedFilesDir() + QStringLiteral("/part"));
+    emit receiveTargetDirChanged();
+    prepareReceiveDirectories();
     emit transfersChanged();
     emit onlineUsersChanged();
     emit peersChanged();
@@ -702,6 +735,10 @@ void NetworkManager::loginEcs(const QString& user, const QString& pass)
 
 void NetworkManager::logout()
 {
+    const bool wasLanMode = (m_connectionMode == LanOnlyMode);
+    const QString lanLibraryDir = receivedFilesDir();
+    stopAllWorkers();
+
     if (m_ecsSocket) {
         m_ecsSocket->disconnectFromHost();
         m_ecsSocket->deleteLater();
@@ -710,10 +747,17 @@ void NetworkManager::logout()
     m_ecsConnected = false;
     m_ecsPending.clear();
     m_connectionMode = Disconnected;
+    m_myName.clear();
     m_onlineUsersList.clear();
+    m_pendingRequests.clear();
+    m_receiveTargetDir.clear();
+    if (wasLanMode)
+        clearDirectoryContents(lanLibraryDir);
     emit ecsConnectedChanged();
     emit connectionModeChanged();
+    emit myNameChanged();
     emit receivedFilesDirChanged();
+    emit receiveTargetDirChanged();
     emit onlineUsersChanged();
 }
 
@@ -730,9 +774,9 @@ void NetworkManager::clearLocalData()
     m_chatSettings.remove(chatHistoryKey());
     emit chatMessagesChanged();
 
-    QDir().mkpath(receivedFilesDir());
+    prepareReceiveDirectories();
     clearDirectoryContents(receivedFilesDir());
-    QDir().mkpath(receivedFilesDir() + QStringLiteral("/part"));
+    prepareReceiveDirectories();
 
     emit notification(QStringLiteral("本地记录已清空"));
 }
@@ -754,19 +798,15 @@ void NetworkManager::clearAllLocalData()
     emit chatMessagesChanged();
 
     QDir root(appRootDir());
-    QDir legacyReceived(root.absoluteFilePath(QStringLiteral("received_file")));
-    if (legacyReceived.exists())
-        clearDirectoryContents(legacyReceived.absolutePath());
+    if (root.exists())
+        clearDirectoryContents(root.absolutePath());
 
-    const QFileInfoList children = root.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
-    for (const QFileInfo& child : children) {
-        QDir childReceived(QDir(child.absoluteFilePath()).absoluteFilePath(QStringLiteral("received_file")));
-        if (childReceived.exists())
-            clearDirectoryContents(childReceived.absolutePath());
-    }
-
-    QDir().mkpath(receivedFilesDir() + QStringLiteral("/part"));
+    loadLibraryRootDirSetting();
+    loadReceiveTargetDirSetting();
+    prepareReceiveDirectories();
+    emit libraryRootDirChanged();
     emit receivedFilesDirChanged();
+    emit receiveTargetDirChanged();
     emit notification(QStringLiteral("所有本地记录已清空"));
 }
 
@@ -780,6 +820,8 @@ void NetworkManager::startLanMode(const QString& displayName)
         m_transferDisplay.clear();
     }
     m_pendingRequests.clear();
+    loadLibraryRootDirSetting();
+    loadReceiveTargetDirSetting();
     m_chatMessages.clear();
     {
         QMutexLocker lock(&m_peersMutex);
@@ -787,7 +829,10 @@ void NetworkManager::startLanMode(const QString& displayName)
     }
     emit myNameChanged();
     emit receivedFilesDirChanged();
-    QDir().mkpath(receivedFilesDir() + QStringLiteral("/part"));
+    emit receiveTargetDirChanged();
+    QDir().mkpath(receivedFilesDir());
+    clearDirectoryContents(receivedFilesDir());
+    prepareReceiveDirectories();
     emit chatMessagesChanged();
     emit transfersChanged();
     emit onlineUsersChanged();
@@ -1039,6 +1084,20 @@ void NetworkManager::handleServerLine(const QString& line)
         return;
     }
 
+    // ---------- CANCEL ----------
+    if (line.startsWith(QStringLiteral("CANCEL "))) {
+        int taskId = line.mid(7).trimmed().toInt();
+        TransferDisplayInfo info;
+        {
+            QMutexLocker lock(&m_transferDisplayMutex);
+            info = m_transferDisplay.value(taskId);
+        }
+        cancelTaskInternal(taskId, false);
+        if (info.taskId != 0)
+            emit notification(QStringLiteral("%1\u4f20\u8f93\u8bb0\u5f55\u5df2\u88ab\u5bf9\u65b9\u53d6\u6d88").arg(info.fileName));
+        return;
+    }
+
     // ---------- ONLINE (user list response) ----------
     if (line.startsWith(QStringLiteral("ONLINE"))) {
         QStringList users;
@@ -1073,6 +1132,8 @@ void NetworkManager::handleServerLine(const QString& line)
                 auto& d = m_transferDisplay[taskId];
                 d.state = "completed";
                 d.bytesTransferred = d.fileSize;
+                d.endedAt = QDateTime::currentMSecsSinceEpoch();
+                d.errorMessage.clear();
                 doneInfo = d;
             }
         }
@@ -1281,6 +1342,22 @@ void NetworkManager::onLanCtrlNewConnection()
                     enqueueIncomingOffer(offer);
                     // Don't close the socket yet — we reply ACCEPT/REJECT later
                 }
+            } else if (req.startsWith(QStringLiteral("LAN_FILE_CANCEL "))) {
+                QStringList parts = req.split(' ', Qt::SkipEmptyParts);
+                if (parts.size() >= 3) {
+                    int taskId = parts[1].toInt();
+                    QString fileName = safeTransferFileName(decodeProtocolToken(parts[2]));
+                    TransferDisplayInfo info;
+                    {
+                        QMutexLocker lock(&m_transferDisplayMutex);
+                        info = m_transferDisplay.value(taskId);
+                    }
+                    cancelTaskInternal(taskId, false);
+                    emit notification(QStringLiteral("%1\u4f20\u8f93\u8bb0\u5f55\u5df2\u88ab\u5bf9\u65b9\u53d6\u6d88")
+                                          .arg(info.taskId != 0 ? info.fileName : fileName));
+                }
+                client->disconnectFromHost();
+                client->deleteLater();
             } else {
                 client->disconnectFromHost();
                 client->deleteLater();
@@ -1628,6 +1705,54 @@ QString NetworkManager::desktopDir() const
     return dir;
 }
 
+QString NetworkManager::libraryRootDir() const
+{
+    return m_libraryRootDir.isEmpty() ? defaultLibraryRootDir() : m_libraryRootDir;
+}
+
+void NetworkManager::setLibraryRootDir(const QString& dirOrUrl)
+{
+    if (m_connectionMode != Disconnected) {
+        emit notification(QStringLiteral("\u8bf7\u5148\u9000\u51fa\u767b\u5f55\u540e\u518d\u4fee\u6539\u6587\u4ef6\u5e93\u8def\u5f84"));
+        return;
+    }
+
+    QString dirPath = QDir::cleanPath(localPathFromUrl(dirOrUrl).trimmed());
+    if (dirPath.isEmpty()) {
+        emit notification(QStringLiteral("\u6587\u4ef6\u5e93\u8def\u5f84\u4e0d\u80fd\u4e3a\u7a7a"));
+        return;
+    }
+
+    QDir dir(dirPath);
+    if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
+        emit notification(QStringLiteral("\u65e0\u6cd5\u521b\u5efa\u6587\u4ef6\u5e93\u8def\u5f84: ") + dirPath);
+        return;
+    }
+
+    const QString absolutePath = dir.absolutePath();
+    if (absolutePath == libraryRootDir())
+        return;
+
+    m_libraryRootDir = absolutePath;
+    m_receivedFilesDir.clear();
+    m_receiveTargetDir.clear();
+    m_chatSettings.setValue(libraryRootDirSettingsKey(), m_libraryRootDir);
+    m_chatSettings.beginGroup(QStringLiteral("receiveTargetDirs"));
+    m_chatSettings.remove(QString());
+    m_chatSettings.endGroup();
+    prepareReceiveDirectories();
+
+    emit libraryRootDirChanged();
+    emit receivedFilesDirChanged();
+    emit receiveTargetDirChanged();
+    emit notification(QStringLiteral("\u6587\u4ef6\u5e93\u8def\u5f84\u5df2\u4fee\u6539: %1").arg(m_libraryRootDir));
+}
+
+void NetworkManager::setReceivedFilesDir(const QString& dirOrUrl)
+{
+    setLibraryRootDir(dirOrUrl);
+}
+
 void NetworkManager::enqueueIncomingOffer(const IncomingOffer& offer)
 {
     if (!offer.valid)
@@ -1779,7 +1904,73 @@ void NetworkManager::resumeTask(int taskId)
                                     info.direction == QStringLiteral("send")
                                         ? QStringLiteral("sending")
                                         : QStringLiteral("receiving"),
-                                    taskId);
+                                     taskId);
+}
+
+void NetworkManager::cancelTask(int taskId)
+{
+    cancelTaskInternal(taskId, true);
+}
+
+void NetworkManager::cancelTaskInternal(int taskId, bool notifyPeer)
+{
+    TransferDisplayInfo info;
+    {
+        QMutexLocker lock(&m_transferDisplayMutex);
+        info = m_transferDisplay.value(taskId);
+    }
+    if (info.taskId == 0)
+        return;
+    if (info.state == QStringLiteral("completed") || info.state == QStringLiteral("failed"))
+        return;
+
+    if (notifyPeer)
+        notifyPeerTaskCanceled(info);
+
+    QSharedPointer<SendTaskInfo> sendTask;
+    {
+        QMutexLocker lock(&m_sendTasksMutex);
+        sendTask = m_sendTasks.value(taskId);
+        if (sendTask) {
+            QMutexLocker taskLock(&sendTask->mtx);
+            sendTask->finished = true;
+            sendTask->paused = false;
+            sendTask->cv.wakeAll();
+        }
+        m_sendTasks.remove(taskId);
+    }
+
+    QSharedPointer<TransferControl> control = m_transferControls.value(taskId);
+    if (control) {
+        QMutexLocker lock(&control->mtx);
+        control->finished = true;
+        control->paused = false;
+        control->cv.wakeAll();
+    }
+
+    QThread* worker = m_workerThreads.value(taskId, nullptr);
+    if (worker) {
+        worker->requestInterruption();
+        worker->quit();
+        worker->wait(1500);
+    }
+    m_workerThreads.remove(taskId);
+    m_transferControls.remove(taskId);
+
+    if (info.direction == QStringLiteral("recv")) {
+        QFile::remove(outputFileNameFor(info.fileName));
+        removeResumeInfo(info.fileName);
+    }
+
+    {
+        QMutexLocker lock(&m_transferDisplayMutex);
+        m_transferDisplay.remove(taskId);
+    }
+    updateFileChatMessageStatus(info.peerName, info.fileName,
+                                info.direction == QStringLiteral("send"),
+                                QStringLiteral("failed"), taskId);
+    emit transfersChanged();
+    emit notification(QStringLiteral("\u5df2\u5220\u9664\u4f20\u8f93\u4efb\u52a1: %1").arg(info.fileName));
 }
 
 void NetworkManager::pauseAll()
@@ -1851,7 +2042,7 @@ void NetworkManager::startRecvWorker(int taskId, const QString& fileName, qint64
     auto control = QSharedPointer<TransferControl>::create();
     m_transferControls[taskId] = control;
     auto* worker = new RecvWorkerThread(taskId, fileName, fileSize, resumeChunk,
-                                        isLan, baseDataDir(), control);
+                                        isLan, receiveTargetDir(), control);
     m_workerThreads[taskId] = worker;
 
     if (isLan && lanDataSocket) {
@@ -1910,6 +2101,8 @@ void NetworkManager::onWorkerFinished(int taskId)
             auto& d = m_transferDisplay[taskId];
             d.state = "completed";
             d.bytesTransferred = d.fileSize;
+            d.endedAt = QDateTime::currentMSecsSinceEpoch();
+            d.errorMessage.clear();
             info = d;
         }
     }
@@ -1938,8 +2131,11 @@ void NetworkManager::onWorkerError(int taskId, const QString& message)
     {
         QMutexLocker lock(&m_transferDisplayMutex);
         if (m_transferDisplay.contains(taskId)) {
-            m_transferDisplay[taskId].state = "failed";
-            info = m_transferDisplay[taskId];
+            auto& d = m_transferDisplay[taskId];
+            d.state = "failed";
+            d.endedAt = QDateTime::currentMSecsSinceEpoch();
+            d.errorMessage = message;
+            info = d;
         }
     }
     m_workerThreads.remove(taskId);
@@ -2001,32 +2197,12 @@ void NetworkManager::stopAllWorkers()
 
 QString NetworkManager::appRootDir() const
 {
-#ifdef Q_OS_ANDROID
-    QString androidDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    if (!androidDir.isEmpty())
-        return androidDir;
-    return QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-#else
-    auto findProjectRoot = [](const QString& startPath) -> QString {
-        QDir dir(startPath);
-        for (int i = 0; i < 8; ++i) {
-            if (QFileInfo::exists(dir.absoluteFilePath(QStringLiteral("CMakeLists.txt"))) &&
-                QDir(dir.absoluteFilePath(QStringLiteral("qml"))).exists()) {
-                return dir.absolutePath();
-            }
-            if (!dir.cdUp())
-                break;
-        }
-        return QString();
-    };
-
-    QString dir = findProjectRoot(QDir::currentPath());
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     if (dir.isEmpty())
-        dir = findProjectRoot(QCoreApplication::applicationDirPath());
+        dir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
     if (dir.isEmpty())
         dir = QCoreApplication::applicationDirPath();
-    return dir;
-#endif
+    return QDir(dir).absolutePath();
 }
 
 QString NetworkManager::accountFolderName() const
@@ -2046,25 +2222,192 @@ QString NetworkManager::chatHistoryKey() const
     return QStringLiteral("messages/%1").arg(accountFolderName());
 }
 
+QString NetworkManager::defaultLibraryRootDir() const
+{
+    return appRootDir();
+}
+
+QString NetworkManager::libraryRootDirSettingsKey() const
+{
+    return QStringLiteral("libraryRootDir");
+}
+
+QString NetworkManager::receiveTargetDirSettingsKey() const
+{
+    return QStringLiteral("receiveTargetDirs/%1").arg(accountFolderName());
+}
+
 QString NetworkManager::baseDataDir() const
 {
-    return appRootDir() + "/" + accountFolderName();
+    return QDir(libraryRootDir()).absoluteFilePath(accountFolderName());
+}
+
+QString NetworkManager::defaultReceivedFilesDir() const
+{
+    return baseDataDir();
 }
 
 QString NetworkManager::receivedFilesDir() const
 {
-    return baseDataDir() + "/received_file";
+    return m_receivedFilesDir.isEmpty() ? defaultReceivedFilesDir() : m_receivedFilesDir;
+}
+
+QString NetworkManager::receiveTargetDir() const
+{
+    return m_receiveTargetDir.isEmpty() ? receivedFilesDir() : m_receiveTargetDir;
+}
+
+void NetworkManager::setReceiveTargetDir(const QString& dirOrUrl)
+{
+    QString dirPath = QDir::cleanPath(localPathFromUrl(dirOrUrl).trimmed());
+    if (dirPath.isEmpty()) {
+        emit notification(QStringLiteral("\u63a5\u6536\u8def\u5f84\u4e0d\u80fd\u4e3a\u7a7a"));
+        return;
+    }
+
+    QDir dir(dirPath);
+    if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
+        emit notification(QStringLiteral("\u65e0\u6cd5\u521b\u5efa\u63a5\u6536\u8def\u5f84: ") + dirPath);
+        return;
+    }
+
+    const QString absolutePath = dir.absolutePath();
+    if (absolutePath == receiveTargetDir())
+        return;
+
+    QString libraryPath = QDir(receivedFilesDir()).absolutePath();
+    QString normalizedTarget = absolutePath;
+    libraryPath.replace('\\', '/');
+    normalizedTarget.replace('\\', '/');
+    if (normalizedTarget != libraryPath && !normalizedTarget.startsWith(libraryPath + QStringLiteral("/"))) {
+        emit notification(QStringLiteral("\u63a5\u6536\u8def\u5f84\u5fc5\u987b\u5728\u5f53\u524d\u6587\u4ef6\u5e93\u5185"));
+        return;
+    }
+
+    m_receiveTargetDir = absolutePath;
+    m_chatSettings.setValue(receiveTargetDirSettingsKey(), m_receiveTargetDir);
+    QDir().mkpath(m_receiveTargetDir + QStringLiteral("/part"));
+    emit receiveTargetDirChanged();
+    emit notification(QStringLiteral("\u9ed8\u8ba4\u63a5\u6536\u8def\u5f84\u5df2\u4fee\u6539: %1").arg(m_receiveTargetDir));
+}
+
+bool NetworkManager::createLibraryFolder(const QString& parentDirOrUrl, const QString& folderName)
+{
+    const QString parentPath = QDir::cleanPath(localPathFromUrl(parentDirOrUrl));
+    QDir parentDir(parentPath);
+    if (!parentDir.exists()) {
+        emit notification(QStringLiteral("\u7236\u76ee\u5f55\u4e0d\u5b58\u5728: ") + parentPath);
+        return false;
+    }
+
+    QString cleanName = QFileInfo(folderName.trimmed()).fileName();
+    cleanName.replace(QRegularExpression(QStringLiteral("[\\\\/:*?\"<>|\\x00-\\x1f]+")), QStringLiteral("_"));
+    cleanName = cleanName.trimmed();
+    if (cleanName.isEmpty() || cleanName == QStringLiteral(".") || cleanName == QStringLiteral(".."))
+        cleanName = QStringLiteral("\u65b0\u5efa\u6587\u4ef6\u5939");
+
+    QString candidate = cleanName;
+    int index = 1;
+    while (parentDir.exists(candidate)) {
+        candidate = QStringLiteral("%1 (%2)").arg(cleanName).arg(index);
+        ++index;
+    }
+
+    if (!parentDir.mkdir(candidate)) {
+        emit notification(QStringLiteral("\u65e0\u6cd5\u65b0\u5efa\u6587\u4ef6\u5939: ") + candidate);
+        return false;
+    }
+
+    emit notification(QStringLiteral("\u5df2\u65b0\u5efa\u6587\u4ef6\u5939: %1").arg(candidate));
+    return true;
+}
+
+void NetworkManager::copyLibraryItem(const QString& pathOrUrl)
+{
+    const QString path = QDir::cleanPath(localPathFromUrl(pathOrUrl));
+    QFileInfo info(path);
+    if (!info.exists()) {
+        emit notification(QStringLiteral("\u6587\u4ef6\u4e0d\u5b58\u5728: ") + path);
+        return;
+    }
+    m_libraryClipboardPath = info.absoluteFilePath();
+    emit notification(QStringLiteral("\u5df2\u590d\u5236: %1").arg(info.fileName()));
+}
+
+bool NetworkManager::pasteLibraryItem(const QString& targetDirOrUrl)
+{
+    QFileInfo source(m_libraryClipboardPath);
+    if (!source.exists()) {
+        emit notification(QStringLiteral("\u6ca1\u6709\u53ef\u7c98\u8d34\u7684\u6587\u4ef6"));
+        return false;
+    }
+
+    QDir targetDir(QDir::cleanPath(localPathFromUrl(targetDirOrUrl)));
+    if (!targetDir.exists()) {
+        emit notification(QStringLiteral("\u76ee\u6807\u76ee\u5f55\u4e0d\u5b58\u5728: ") + targetDir.absolutePath());
+        return false;
+    }
+
+    const QFileInfo nameInfo(source.fileName());
+    const QString baseName = source.isDir() ? source.fileName() : nameInfo.completeBaseName();
+    const QString suffix = source.isDir() ? QString() : nameInfo.suffix();
+    QString targetName = source.fileName();
+    QString targetPath = targetDir.absoluteFilePath(targetName);
+    int copyIndex = 1;
+    while (QFileInfo::exists(targetPath)) {
+        targetName = suffix.isEmpty()
+                         ? QStringLiteral("%1 (%2)").arg(baseName).arg(copyIndex)
+                         : QStringLiteral("%1 (%2).%3").arg(baseName).arg(copyIndex).arg(suffix);
+        targetPath = targetDir.absoluteFilePath(targetName);
+        ++copyIndex;
+    }
+
+    const bool ok = source.isDir()
+                        ? copyDirectoryRecursively(source.absoluteFilePath(), targetPath)
+                        : QFile::copy(source.absoluteFilePath(), targetPath);
+    if (!ok) {
+        emit notification(QStringLiteral("\u7c98\u8d34\u5931\u8d25: ") + targetName);
+        return false;
+    }
+
+    emit notification(QStringLiteral("\u5df2\u7c98\u8d34: %1").arg(targetName));
+    return true;
+}
+
+bool NetworkManager::deleteLibraryItem(const QString& pathOrUrl)
+{
+    const QString path = QDir::cleanPath(localPathFromUrl(pathOrUrl));
+    QFileInfo info(path);
+    if (!info.exists()) {
+        emit notification(QStringLiteral("\u6587\u4ef6\u4e0d\u5b58\u5728: ") + path);
+        return false;
+    }
+    if (info.fileName() == QStringLiteral("part")) {
+        emit notification(QStringLiteral("\u8be5\u76ee\u5f55\u4e0d\u53ef\u5220\u9664"));
+        return false;
+    }
+
+    const bool ok = info.isDir()
+                        ? QDir(info.absoluteFilePath()).removeRecursively()
+                        : QFile::remove(info.absoluteFilePath());
+    if (!ok) {
+        emit notification(QStringLiteral("\u5220\u9664\u5931\u8d25: ") + info.fileName());
+        return false;
+    }
+
+    emit notification(QStringLiteral("\u5df2\u5220\u9664: %1").arg(info.fileName()));
+    return true;
 }
 
 QString NetworkManager::outputFileNameFor(const QString& fileName) const
 {
-    QDir dir(baseDataDir() + "/received_file");
+    QDir dir(receiveTargetDir());
     return dir.absoluteFilePath(safeTransferFileName(fileName));
 }
 
 QString NetworkManager::resumeFileNameFor(const QString& fileName) const
 {
-    QDir dir(baseDataDir() + "/received_file/part");
+    QDir dir(receiveTargetDir() + QStringLiteral("/part"));
     return dir.absoluteFilePath(safeTransferFileName(fileName) + ".resume");
 }
 
@@ -2139,7 +2482,7 @@ bool NetworkManager::loadResumeInfo(const QString& fileName, qint64 expectedSize
 void NetworkManager::saveResumeInfo(const QString& fileName, qint64 fileSize,
                                     qint64 chunkSize, int nextChunk)
 {
-    QDir().mkpath(baseDataDir() + "/received_file/part");
+    QDir().mkpath(receiveTargetDir() + QStringLiteral("/part"));
     const QString safeName = safeTransferFileName(fileName);
     QFile f(resumeFileNameFor(safeName));
     if (f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -2158,6 +2501,66 @@ void NetworkManager::saveResumeInfo(const QString& fileName, qint64 fileSize,
 void NetworkManager::removeResumeInfo(const QString& fileName)
 {
     QFile::remove(resumeFileNameFor(fileName));
+}
+
+void NetworkManager::loadLibraryRootDirSetting()
+{
+    const QString saved = m_chatSettings.value(libraryRootDirSettingsKey()).toString().trimmed();
+    if (saved.isEmpty()) {
+        m_libraryRootDir.clear();
+        m_receivedFilesDir.clear();
+        return;
+    }
+
+    const QString clean = QDir::cleanPath(saved);
+    QDir dir(clean);
+    if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
+        m_libraryRootDir.clear();
+        m_receivedFilesDir.clear();
+        return;
+    }
+    m_libraryRootDir = dir.absolutePath();
+    m_receivedFilesDir.clear();
+}
+
+void NetworkManager::loadReceiveTargetDirSetting()
+{
+    const QString saved = m_chatSettings.value(receiveTargetDirSettingsKey()).toString().trimmed();
+    if (saved.isEmpty()) {
+        m_receiveTargetDir.clear();
+        return;
+    }
+
+    const QString clean = QDir::cleanPath(saved);
+    QDir dir(clean);
+    if (!dir.exists() && !dir.mkpath(QStringLiteral("."))) {
+        m_receiveTargetDir.clear();
+        return;
+    }
+
+    QString libraryPath = QDir(receivedFilesDir()).absolutePath();
+    QString targetPath = dir.absolutePath();
+    libraryPath.replace('\\', '/');
+    targetPath.replace('\\', '/');
+    if (targetPath != libraryPath && !targetPath.startsWith(libraryPath + QStringLiteral("/"))) {
+        m_receiveTargetDir.clear();
+        return;
+    }
+
+    m_receiveTargetDir = dir.absolutePath();
+}
+
+void NetworkManager::prepareReceiveDirectories()
+{
+    QDir().mkpath(receivedFilesDir());
+    QDir().mkpath(receiveTargetDir() + QStringLiteral("/part"));
+}
+
+void NetworkManager::clearLanTemporaryLibrary()
+{
+    if (m_connectionMode != LanOnlyMode)
+        return;
+    clearDirectoryContents(receivedFilesDir());
 }
 
 bool NetworkManager::isSelfName(const QString& name) const
@@ -2199,7 +2602,7 @@ bool NetworkManager::copyFileToReceivedDir(const QString& filePath, QString* sav
         return false;
     }
 
-    QDir recvDir(receivedFilesDir());
+    QDir recvDir(receiveTargetDir());
     if (!recvDir.exists() && !recvDir.mkpath(QStringLiteral("."))) {
         emit notification(QStringLiteral("无法创建文件库目录: ") + recvDir.absolutePath());
         return false;
@@ -2258,6 +2661,48 @@ bool NetworkManager::isUserOnline(const QString& name) const
 
     QMutexLocker lock(const_cast<QMutex*>(&m_peersMutex));
     return m_discoveredPeers.contains(cleanName);
+}
+
+void NetworkManager::notifyPeerTaskCanceled(const TransferDisplayInfo& info)
+{
+    if (info.taskId == 0)
+        return;
+
+    if (!info.isLan) {
+        sendCtrlText(QStringLiteral("CANCEL %1\n").arg(info.taskId));
+        return;
+    }
+
+    QString peerHost = info.peerName;
+    if (peerHost.startsWith(QStringLiteral("::ffff:")))
+        peerHost = peerHost.mid(7);
+    if (peerHost.isEmpty())
+        return;
+
+    int peerPort = LAN_CTRL_PORT;
+    if (!peerHost.contains('.')) {
+        QMutexLocker lock(&m_peersMutex);
+        const QString endpoint = m_discoveredPeers.value(peerHost);
+        const int colon = endpoint.indexOf(':');
+        if (colon > 0) {
+            peerHost = endpoint.left(colon);
+            peerPort = endpoint.mid(colon + 1).toInt();
+        }
+    }
+
+    auto* sock = new QTcpSocket(this);
+    tuneDataSocket(sock);
+    connect(sock, &QTcpSocket::connected, this, [this, sock, info]() {
+        const QString msg = QStringLiteral("LAN_FILE_CANCEL %1 %2\n")
+                                .arg(info.taskId)
+                                .arg(encodeProtocolToken(info.fileName));
+        sock->write(msg.toUtf8());
+        sock->flush();
+        sock->disconnectFromHost();
+    });
+    connect(sock, &QTcpSocket::disconnected, sock, &QObject::deleteLater);
+    connect(sock, &QTcpSocket::errorOccurred, sock, &QObject::deleteLater);
+    sock->connectToHost(peerHost, peerPort);
 }
 
 void NetworkManager::appendChatMessage(const QString& from, const QString& to, const QString& text,
@@ -2407,7 +2852,14 @@ void NetworkManager::updateTransferDisplay(int taskId, const TransferDisplayInfo
 {
     {
         QMutexLocker lock(&m_transferDisplayMutex);
-        m_transferDisplay[taskId] = info;
+        TransferDisplayInfo next = info;
+        if (next.startedAt <= 0) {
+            const auto existing = m_transferDisplay.constFind(taskId);
+            next.startedAt = existing != m_transferDisplay.constEnd()
+                                 ? existing.value().startedAt
+                                 : QDateTime::currentMSecsSinceEpoch();
+        }
+        m_transferDisplay[taskId] = next;
     }
     emit transfersChanged();
 }

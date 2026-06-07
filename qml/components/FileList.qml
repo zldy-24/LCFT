@@ -46,7 +46,7 @@ Rectangle {
                     spacing: 3
                     Text {
                         Layout.fillWidth: true
-                        text: index === 0 ? "\u9ed8\u8ba4\u6587\u4ef6\u5e93" : modelData.split(/[\\/]/).pop()
+                        text: index === 0 ? "\u5f53\u524d\u6587\u4ef6\u5e93" : modelData.split(/[\\/]/).pop()
                         color: "#111827"
                         font.pixelSize: 15
                         font.bold: true

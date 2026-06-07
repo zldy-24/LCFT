@@ -6,6 +6,8 @@ Rectangle {
     id: root
     color: "#ffffff"
     property string searchText: ""
+    property int selectedTaskId: 0
+    signal transferSelected(var transferInfo)
     property var filteredTransfers: {
         var text = searchText.trim().toLowerCase()
         var rows = []
@@ -71,17 +73,52 @@ Rectangle {
                 id: transferDelegate
                 width: list.width
                 height: 92
+                highlighted: modelData.taskId === root.selectedTaskId
                 background: Rectangle {
-                    color: transferDelegate.down ? "#f1f3f5" : (transferDelegate.highlighted ? "#f5f6f7" : "#ffffff")
+                    color: transferDelegate.down ? "#e5e7eb" : (transferDelegate.highlighted ? "#eef2f7" : "#ffffff")
+                    Rectangle {
+                        visible: transferDelegate.highlighted
+                        width: 3
+                        anchors.left: parent.left
+                        anchors.top: parent.top
+                        anchors.bottom: parent.bottom
+                        color: "#2563eb"
+                    }
                 }
                 contentItem: ColumnLayout {
                     spacing: 8
-                    Text {
+                    RowLayout {
                         Layout.fillWidth: true
-                        text: modelData.fileName + "  [" + root.stateText(modelData.state) + "]"
-                        font.bold: true
-                        color: "#111827"
-                        elide: Text.ElideRight
+                        spacing: 6
+                        Text {
+                            Layout.fillWidth: true
+                            text: modelData.fileName + "  [" + root.stateText(modelData.state) + "]"
+                            font.bold: true
+                            color: "#111827"
+                            elide: Text.ElideRight
+                        }
+                        Button {
+                            visible: root.isActive(modelData.state)
+                            Layout.preferredWidth: 22
+                            Layout.preferredHeight: 22
+                            padding: 0
+                            text: "\u00d7"
+                            font.pixelSize: 16
+                            font.bold: true
+                            background: Rectangle {
+                                radius: 11
+                                color: parent.down ? "#fecaca" : "#fee2e2"
+                                border.color: "#fca5a5"
+                            }
+                            contentItem: Text {
+                                text: parent.text
+                                color: "#dc2626"
+                                font: parent.font
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            onClicked: networkManager.cancelTask(modelData.taskId)
+                        }
                     }
                     ProgressBar {
                         Layout.fillWidth: true
@@ -108,6 +145,7 @@ Rectangle {
                         }
                     }
                 }
+                onClicked: root.transferSelected(modelData)
             }
         }
     }
@@ -119,6 +157,10 @@ Rectangle {
         if (state === "completed") return "\u5df2\u5b8c\u6210"
         if (state === "failed") return "\u5931\u8d25"
         return state || ""
+    }
+
+    function isActive(state) {
+        return state === "sending" || state === "receiving" || state === "paused"
     }
 
     function fileSuffix(name) {

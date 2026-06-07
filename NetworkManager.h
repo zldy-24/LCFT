@@ -105,6 +105,9 @@ struct TransferDisplayInfo {
     QString peerName;
     bool isLan = false;
     QString direction;  // "send" or "recv"
+    qint64 startedAt = 0;
+    qint64 endedAt = 0;
+    QString errorMessage;
 };
 
 // ============ NetworkManager ============
@@ -133,7 +136,9 @@ class NetworkManager : public QObject {
 
     // ---- Chat Messages ----
     Q_PROPERTY(QVariantList chatMessages READ chatMessages NOTIFY chatMessagesChanged)
+    Q_PROPERTY(QString libraryRootDir READ libraryRootDir NOTIFY libraryRootDirChanged)
     Q_PROPERTY(QString receivedFilesDir READ receivedFilesDir NOTIFY receivedFilesDirChanged)
+    Q_PROPERTY(QString receiveTargetDir READ receiveTargetDir NOTIFY receiveTargetDirChanged)
 
 public:
     enum ConnectionMode {
@@ -180,6 +185,9 @@ public:
     Q_INVOKABLE QString localPathFromUrl(const QString& urlOrPath) const;
     Q_INVOKABLE QString desktopDir() const;
     Q_INVOKABLE void ensureConversation(const QString& peerName);
+    Q_INVOKABLE QString libraryRootDir() const;
+    Q_INVOKABLE void setLibraryRootDir(const QString& dirOrUrl);
+    Q_INVOKABLE void setReceivedFilesDir(const QString& dirOrUrl);
 
     // Incoming Offer
     Q_INVOKABLE void acceptOffer();
@@ -188,11 +196,18 @@ public:
     // Pause / Resume
     Q_INVOKABLE void pauseTask(int taskId);
     Q_INVOKABLE void resumeTask(int taskId);
+    Q_INVOKABLE void cancelTask(int taskId);
     Q_INVOKABLE void pauseAll();
     Q_INVOKABLE void resumeAll();
 
     // Utility
     Q_INVOKABLE QString receivedFilesDir() const;
+    Q_INVOKABLE QString receiveTargetDir() const;
+    Q_INVOKABLE void setReceiveTargetDir(const QString& dirOrUrl);
+    Q_INVOKABLE bool createLibraryFolder(const QString& parentDirOrUrl, const QString& folderName);
+    Q_INVOKABLE void copyLibraryItem(const QString& pathOrUrl);
+    Q_INVOKABLE bool pasteLibraryItem(const QString& targetDirOrUrl);
+    Q_INVOKABLE bool deleteLibraryItem(const QString& pathOrUrl);
     Q_INVOKABLE void clearLocalData();
     Q_INVOKABLE void clearAllLocalData();
 
@@ -206,7 +221,9 @@ signals:
     void transfersChanged();
     void incomingOfferChanged();
     void chatMessagesChanged();
+    void libraryRootDirChanged();
     void receivedFilesDirChanged();
+    void receiveTargetDirChanged();
 
     // Action result signals
     void loginResult(bool success, const QString& error);
@@ -246,7 +263,11 @@ private:
     QString appRootDir() const;
     QString accountFolderName() const;
     QString chatHistoryKey() const;
+    QString defaultLibraryRootDir() const;
+    QString libraryRootDirSettingsKey() const;
+    QString receiveTargetDirSettingsKey() const;
     QString baseDataDir() const;
+    QString defaultReceivedFilesDir() const;
     QString outputFileNameFor(const QString& fileName) const;
     QString resumeFileNameFor(const QString& fileName) const;
     QString safeTransferFileName(const QString& fileName) const;
@@ -263,6 +284,8 @@ private:
     QString encodeProtocolToken(const QString& value) const;
     QString decodeProtocolToken(const QString& value) const;
     bool isUserOnline(const QString& name) const;
+    void notifyPeerTaskCanceled(const TransferDisplayInfo& info);
+    void cancelTaskInternal(int taskId, bool notifyPeer);
     void appendChatMessage(const QString& from, const QString& to, const QString& text,
                            bool isMe, const QVariantMap& extra = QVariantMap());
     void appendFileChatMessage(const QString& peer, const QString& fileName, qint64 fileSize,
@@ -277,6 +300,10 @@ private:
     void removeLanChatMessages();
     void loadChatHistory();
     void saveChatHistory();
+    void loadLibraryRootDirSetting();
+    void loadReceiveTargetDirSetting();
+    void prepareReceiveDirectories();
+    void clearLanTemporaryLibrary();
 
     // ---- Transfer Display ----
     void updateTransferDisplay(int taskId, const TransferDisplayInfo& info);
@@ -341,6 +368,10 @@ private:
     // Chat messages
     QVariantList m_chatMessages;
     QSettings m_chatSettings;
+    QString m_libraryRootDir;
+    QString m_receivedFilesDir;
+    QString m_receiveTargetDir;
+    QString m_libraryClipboardPath;
 
     // Task ID counter for LAN
     QAtomicInt m_lanLocalTaskId{5000};
